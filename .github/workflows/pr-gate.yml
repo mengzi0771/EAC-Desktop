@@ -2,7 +2,7 @@
 #
 # 设计依据见 D:\Project\EAC\00-分析报告\21-CI策略建议.md
 #   1) 只允许"因本次改动而红"的检查进 PR；全仓账本/四平台/全量构建一律留给夜间
-#   2) 上线第一天必须绿；不确定的先 continue-on-error，绿了再摘
+#   2) 上线第一天必须绿：首跑观察 → 绿后收紧（continue-on-error 已于 2026-11-22 首跑绿后摘除）
 #   3) 不构建、不打包、不跑 GUI —— 目标 10 分钟内出结果
 #
 # 首跑：Actions 页面手动 Run workflow，先确认两个 job 是绿的。
@@ -68,9 +68,6 @@ jobs:
       run:
         working-directory: dsh-desktop
 
-    # 首跑先观察：它红了而 syntax 绿，多半是环境差异而不是 PR 的错。
-    # 确认能稳定绿之后，删掉下面这一行。
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
