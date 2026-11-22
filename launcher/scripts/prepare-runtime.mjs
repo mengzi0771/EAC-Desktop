@@ -58,10 +58,19 @@ const staging = join(cache, `extract-${platform}-${arch}`)
 await rm(staging, { recursive: true, force: true })
 await mkdir(staging, { recursive: true })
 if (platform === 'win32') {
-  const literal = value => `'${value.replaceAll("'", "''")}'`
-  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `Expand-Archive -LiteralPath ${literal(archive)} -DestinationPath ${literal(staging)}`],
-  { stdio: 'inherit', windowsHide: true })
+  // bsdtar（Windows 10 1803+ 自带，GitHub runner 也有）比 Expand-Archive 稳：
+  // 后者依赖 PowerShell 的 Microsoft.PowerShell.Archive 模块，在 .NET 版本不匹配时
+  // 会抛 MethodCountCouldNotFindBest（ExtractToDirectory 找不到重载），
+  // 解压后 node.exe 不存在，下一步 spawnSync 直接 ENOENT。
+  try {
+    execFileSync('tar', ['-xf', archive, '-C', staging], { stdio: 'inherit', windowsHide: true })
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+    const literal = value => `'${value.replaceAll("'", "''")}'`
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      `Expand-Archive -LiteralPath ${literal(archive)} -DestinationPath ${literal(staging)}`],
+    { stdio: 'inherit', windowsHide: true })
+  }
 } else {
   execFileSync('tar', ['-xzf', archive, '-C', staging], { stdio: 'inherit' })
 }
