@@ -36,6 +36,12 @@ const triple = targetArg > -1 ? process.argv[targetArg + 1] : '';
 if (targetArg > -1 && (!triple || triple.startsWith('--'))) throw new Error('--target requires a build triple');
 if (triple && !['x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'].includes(triple)) throw new Error('Unsupported portable build target');
 const rel = path.join(shellDir, 'target', ...(triple ? [triple] : []), 'release');
+// 载荷来源：tauri build 只把 bundle.resources 装进 NSIS 安装包，不会把
+// staged-resources 复制到 target/release。因此便携包回落到暂存目录 ——
+// 两者同构（stage-resources.mjs 写的就是 staged-resources/<name>/），
+// 只有 target/release 里确实带载荷时才优先用它（旧缓存/本地全量构建）。
+const stagedPayload = path.join(shellDir, 'staged-resources');
+const payloadRoot = existsSync(path.join(rel, 'sidecar', 'server.js')) ? rel : stagedPayload;
 const version = JSON.parse(readFileSync(path.join(repo, 'dsh-desktop', 'package.json'), 'utf8')).version || '0.0.0';
 
 const outArg = process.argv.indexOf('--out');
@@ -43,12 +49,20 @@ if (outArg > -1 && (!process.argv[outArg + 1] || process.argv[outArg + 1].starts
 const outDir = outArg > -1 ? path.resolve(process.argv[outArg + 1]) : path.join(rel, 'portable');
 
 const exe = path.join(rel, 'dsh-eac-shell.exe');
-for (const need of [exe, path.join(rel, 'sidecar', 'server.js'), path.join(rel, 'dsh-desktop', 'package.json'), path.join(rel, 'ui-skin-manager', 'resolved', 'system.default', 'snapshot.json'), path.join(rel, 'dpx', 'src', 'index.js')]) {
-  if (!existsSync(need)) {
-    console.error('[portable] 缺少构建产物: ' + need);
-    console.error('[portable] 请先完成 tauri build（或 node stage-resources.mjs 后 cargo tauri build）');
+const payloads = ['sidecar/server.js', 'dsh-desktop/package.json', 'ui-skin-manager/resolved/system.default/snapshot.json', 'dpx/src/index.js'];
+for (const [root, label] of [[rel, 'tauri build 产物'], [stagedPayload, 'staged-resources']]) {
+  const missing = payloads.filter((p) => !existsSync(path.join(root, ...p.split('/'))));
+  if (missing.length === 0) break;
+  if (root === stagedPayload) {
+    for (const p of missing) console.error('[portable] 缺少载荷: ' + path.join(root, ...p.split('/')));
+    console.error('[portable] 请先完成 tauri build，或先运行 node stage-resources.mjs 装配暂存目录');
     process.exit(1);
   }
+}
+if (!existsSync(exe)) {
+  console.error('[portable] 缺少壳可执行文件: ' + exe);
+  console.error('[portable] 请先完成 tauri build（cargo build 只产 dsh-eac-shell.exe 的前置步骤）');
+  process.exit(1);
 }
 
 mkdirSync(outDir, { recursive: true });
@@ -76,7 +90,7 @@ const updateTarget = 'windows-' + arch + '-portable';
 //
 // 判定依据是 staged 的 profile.txt（stage-resources.mjs:406 写入的档位标记），
 // 而不是命令行参数 —— 后者可能与实际装配面不一致，前者是产物的既成事实。
-const profileTxt = path.join(rel, 'dsh-desktop', 'profile.txt');
+const profileTxt = path.join(payloadRoot, 'dsh-desktop', 'profile.txt');
 let distro = 'lite';
 if (existsSync(profileTxt)) {
   const mark = readFileSync(profileTxt, 'utf8').trim();
@@ -104,8 +118,8 @@ writeFileSync(path.join(staging, 'eac-installation.json'), JSON.stringify({schem
 // 静态链接 webview2（导入表无该 DLL），此文件属防御性冗余 —— 故为 best-effort：
 // target/release 下存在才复制，缺失跳过（stage-resources 仅在 win32 且找到
 // webview2-com-sys 时装配它，跨形态/旧缓存缺失属正常，不必 fail-fast）。
-const webview2Loader = path.join(rel, 'WebView2Loader.dll');
-if (existsSync(webview2Loader)) {
+const webview2Loader = [path.join(rel, 'WebView2Loader.dll'), path.join(payloadRoot, 'WebView2Loader.dll')].find((p) => existsSync(p));
+if (webview2Loader) {
   copyFileSync(webview2Loader, path.join(staging, 'WebView2Loader.dll'));
   console.log('[portable] WebView2Loader.dll 已随包（与安装版产物面一致）');
 }
@@ -120,11 +134,12 @@ function robocopy(src, dest) {
   if (code >= 8) throw new Error(`robocopy 失败 (${code}): ${src} -> ${dest}`);
 }
 
+console.log('[portable] 载荷来源: ' + (payloadRoot === rel ? 'target/release' : 'staged-resources（tauri build 不落地资源）'));
 console.log('[portable] 复制 sidecar + dsh-desktop + ui-skin-manager（数万文件，耐心等）');
-robocopy(path.join(rel, 'sidecar'), path.join(staging, 'sidecar'));
-robocopy(path.join(rel, 'dsh-desktop'), path.join(staging, 'dsh-desktop'));
-robocopy(path.join(rel, 'ui-skin-manager'), path.join(staging, 'ui-skin-manager'));
-robocopy(path.join(rel, 'dpx'), path.join(staging, 'dpx'));
+robocopy(path.join(payloadRoot, 'sidecar'), path.join(staging, 'sidecar'));
+robocopy(path.join(payloadRoot, 'dsh-desktop'), path.join(staging, 'dsh-desktop'));
+robocopy(path.join(payloadRoot, 'ui-skin-manager'), path.join(staging, 'ui-skin-manager'));
+robocopy(path.join(payloadRoot, 'dpx'), path.join(staging, 'dpx'));
 
 // 长路径根治（2026-10-24 用户实测 Explorer 解压报 0x80010135）：
 // 变换只作用 staging 临时树 —— staged-resources 与 NSIS 安装版不受影响。
