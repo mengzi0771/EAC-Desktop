@@ -1,0 +1,115 @@
+# PR 门禁 v0.1 —— 只验"不打包也能判对错"的东西
+#
+# 设计依据见 D:\Project\EAC\00-分析报告\21-CI策略建议.md
+#   1) 只允许"因本次改动而红"的检查进 PR；全仓账本/四平台/全量构建一律留给夜间
+#   2) 上线第一天必须绿：首跑观察 → 绿后收紧（continue-on-error 已于 2026-11-22 首跑绿后摘除）
+#   3) 不构建、不打包、不跑 GUI —— 目标 10 分钟内出结果
+#
+# 首跑：Actions 页面手动 Run workflow，先确认两个 job 是绿的。
+
+name: PR gate
+
+on:
+  pull_request:
+    # 纯文档/图片/报告不触发，省得每个 PR 都等十分钟
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'reports/**'
+      - '**/*.png'
+      - '**/*.jpg'
+
+  # 在自己 fork 上试跑用；正式启用后可以保留，方便手动复跑
+  workflow_dispatch:
+
+# 同一个 PR 连着推三次，只跑最后一次
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+  PNPM_VERSION: '11.7.0'
+  # 与 dsh-desktop/package.json 的 file:vendor/kernel 依赖保持一致
+  KERNEL_VERSION: '0.2.1-rc.2'
+
+jobs:
+  # ── job 1：语法。零依赖、二十秒 ──────────────────────────────────
+  syntax:
+    name: 语法
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # 只查构建时真正会被 node 执行的脚本。已跟踪的 286 个 .js 里有插件资产，
+      # 部分是带模板语法的客户端脚本，全查会假红 —— 上一版 CI 就是这么死的。
+      - name: node --check（tauri-shell + dsh-desktop/scripts）
+        run: |
+          set -e
+          for f in tauri-shell/*.mjs dsh-desktop/scripts/*.mjs; do
+            echo "check $f"
+            node --check "$f"
+          done
+
+  # ── job 2：类型 + 白名单单测。约十分钟，依赖内核包缓存 ────────────
+  unit:
+    name: 类型与单测
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: dsh-desktop
+
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: dsh-desktop/package-lock.json
+
+      - name: Install pinned pnpm
+        run: npm install --global pnpm@${{ env.PNPM_VERSION }}
+
+      # 内核包约 382 个 tgz，缓存键跟版本和抓取脚本一起变
+      - name: Cache vendored kernel
+        uses: actions/cache@v4
+        with:
+          path: dsh-desktop/vendor/kernel
+          key: ${{ runner.os }}-${{ env.KERNEL_VERSION }}-kernel-${{ hashFiles('dsh-desktop/scripts/fetch-kernel.ts') }}
+
+      - name: Prepare vendored kernel
+        run: node scripts/fetch-kernel.js
+
+      # npm ci 的 postinstall 会跑 tsc，生成 lib/desktop/*.js
+      - name: Install dependencies
+        run: npm run ci:install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # 白名单，不是 test/*.test.ts 全量：
+      #   - update-portable 有 5 条存量失败（见 release-6.1.0.yml 的
+      #     EAC_RELEASE_SKIP_KNOWN_FLAKY），放进 PR 门禁第一天就红
+      #   - 其余用例等这里稳定后逐批加入
+      - name: Unit tests (whitelist)
+        run: |
+          node scripts/test-runner.js \
+            test/patch-anchor-regression.test.ts \
+            test/bundle-identity.test.ts \
+            test/retirement-cleanup.test.ts \
+            test/full-composition.test.ts \
+            test/lite-skins-seeding.test.ts \
+            --test-timeout=120000 --test-force-exit
